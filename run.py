@@ -1,75 +1,92 @@
+from __future__ import annotations
+
 import argparse
 import json
-from transformers import AutoTokenizer, AutoModel
-from sentence_transformers import SentenceTransformer
-from src.config import LinearRAGConfig
-from src.LinearRAG import LinearRAG
-import os
-import warnings
-from src.evaluate import Evaluator
-from src.utils import LLM_Model
-from src.utils import setup_logging
 from datetime import datetime
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "4"
-warnings.filterwarnings('ignore')
+from src.LinearRAG import LinearRAG
+from src.config import LinearRAGConfig
+from src.evaluate import Evaluator
+from src.langchain_clients import LangChainEmbeddingModel, LangChainLLM
+from src.utils import setup_logging
 
-def parse_arguments():
+
+def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--spacy_model", type=str, default="en_core_web_trf", help="The spacy model to use")
-    parser.add_argument("--embedding_model", type=str, default="model/all-mpnet-base-v2", help="The path of embedding model to use")
-    parser.add_argument("--dataset_name", type=str, default="novel", help="The dataset to use")
-    parser.add_argument("--llm_model", type=str, default="gpt-4o-mini", help="The LLM model to use")
-    parser.add_argument("--max_workers", type=int, default=16, help="The max number of workers to use")
-    parser.add_argument("--max_iterations", type=int, default=3, help="The max number of iterations to use")
-    parser.add_argument("--iteration_threshold", type=float, default=0.4, help="The threshold for iteration")
-    parser.add_argument("--passage_ratio", type=float, default=2, help="The ratio for passage")
-    parser.add_argument("--top_k_sentence", type=int, default=3, help="The top k sentence to use")
-    parser.add_argument("--use_vectorized_retrieval", action="store_true", help="Use vectorized matrix-based retrieval instead of BFS iteration")
+    parser.add_argument("--dataset_name", type=str, default="novel", help="Dataset directory under DATA_DIR")
+    parser.add_argument("--spacy_model", type=str, default=None, help="spaCy model name")
+    parser.add_argument("--llm_model", type=str, default=None, help="LLM model name")
+    parser.add_argument("--embedding_model", type=str, default=None, help="Embedding model name")
+    parser.add_argument("--max_workers", type=int, default=None, help="Maximum worker count")
+    parser.add_argument("--max_iterations", type=int, default=None, help="Maximum graph expansion iterations")
+    parser.add_argument("--iteration_threshold", type=float, default=None, help="Entity activation threshold")
+    parser.add_argument("--passage_ratio", type=float, default=None, help="Weight for dense passage retrieval")
+    parser.add_argument("--top_k_sentence", type=int, default=None, help="Top sentence count per entity expansion")
+    parser.add_argument("--skip_eval", action="store_true", help="Skip answer evaluation")
     return parser.parse_args()
 
 
-def load_dataset(dataset_name): 
-    questions_path = f"dataset/{dataset_name}/questions.json"
-    with open(questions_path, "r", encoding="utf-8") as f:
-        questions = json.load(f)
-    chunks_path = f"dataset/{dataset_name}/chunks.json"
-    with open(chunks_path, "r", encoding="utf-8") as f:
-        chunks = json.load(f)
-    passages = [f'{idx}:{chunk}' for idx, chunk in enumerate(chunks)]
+def load_dataset(config: LinearRAGConfig) -> tuple[list[dict[str, str]], list[str]]:
+    questions_path = config.dataset_dir / "questions.json"
+    chunks_path = config.dataset_dir / "chunks.json"
+
+    with questions_path.open("r", encoding="utf-8") as file:
+        questions = json.load(file)
+    with chunks_path.open("r", encoding="utf-8") as file:
+        chunks = json.load(file)
+
+    passages = [f"{idx}:{chunk}" for idx, chunk in enumerate(chunks)]
     return questions, passages
 
-def load_embedding_model(embedding_model):
-    embedding_model = SentenceTransformer(embedding_model,device="cuda")
-    return embedding_model
 
-def main():
-    time = datetime.now()
-    time_str = time.strftime("%Y-%m-%d_%H-%M-%S")
+def build_config(args: argparse.Namespace) -> LinearRAGConfig:
+    config = LinearRAGConfig(dataset_name=args.dataset_name)
+    if args.spacy_model:
+        config.spacy_model = args.spacy_model
+    if args.llm_model:
+        config.llm_model_name = args.llm_model
+    if args.embedding_model:
+        config.embedding_model_name = args.embedding_model
+    if args.max_workers is not None:
+        config.max_workers = args.max_workers
+    if args.max_iterations is not None:
+        config.max_iterations = args.max_iterations
+    if args.iteration_threshold is not None:
+        config.iteration_threshold = args.iteration_threshold
+    if args.passage_ratio is not None:
+        config.passage_ratio = args.passage_ratio
+    if args.top_k_sentence is not None:
+        config.top_k_sentence = args.top_k_sentence
+    return config
+
+
+def main() -> None:
     args = parse_arguments()
-    embedding_model = load_embedding_model(args.embedding_model)
-    questions,passages = load_dataset(args.dataset_name)
-    setup_logging(f"results/{args.dataset_name}/{time_str}/log.txt")
-    llm_model = LLM_Model(args.llm_model)
-    config = LinearRAGConfig(
-        dataset_name=args.dataset_name,
-        embedding_model=embedding_model,
-        spacy_model=args.spacy_model,
-        max_workers=args.max_workers,
-        llm_model=llm_model,
-        max_iterations=args.max_iterations,
-        iteration_threshold=args.iteration_threshold,
-        passage_ratio=args.passage_ratio,
-        top_k_sentence=args.top_k_sentence,
-        use_vectorized_retrieval=args.use_vectorized_retrieval
-    )
-    rag_model = LinearRAG(global_config=config)
+    config = build_config(args)
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_dir = config.results_dir / config.dataset_name / timestamp
+    setup_logging(str(run_dir / "log.txt"))
+
+    llm_model = LangChainLLM(config)
+    embedding_model = LangChainEmbeddingModel(config)
+    questions, passages = load_dataset(config)
+
+    rag_model = LinearRAG(global_config=config, llm_model=llm_model, embedding_model=embedding_model)
     rag_model.index(passages)
-    questions = rag_model.qa(questions)
-    os.makedirs(f"results/{args.dataset_name}/{time_str}", exist_ok=True)
-    with open(f"results/{args.dataset_name}/{time_str}/predictions.json", "w", encoding="utf-8") as f:
-        json.dump(questions, f, ensure_ascii=False, indent=4)
-    evaluator = Evaluator(llm_model=llm_model, predictions_path=f"results/{args.dataset_name}/{time_str}/predictions.json")
-    evaluator.evaluate(max_workers=args.max_workers)
+    predictions = rag_model.qa(questions)
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    predictions_path = run_dir / "predictions.json"
+    with predictions_path.open("w", encoding="utf-8") as file:
+        json.dump(predictions, file, ensure_ascii=False, indent=2)
+
+    if args.skip_eval:
+        return
+
+    evaluator = Evaluator(llm_model=llm_model, predictions_path=str(predictions_path))
+    evaluator.evaluate(max_workers=config.max_workers)
+
+
 if __name__ == "__main__":
     main()

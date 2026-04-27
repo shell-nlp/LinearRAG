@@ -1,131 +1,110 @@
-# **LinearRAG: Linear Graph Retrieval-Augmented Generation on Large-scale Corpora**  
+# LinearRAG
 
-> A relation-free graph construction method for efficient GraphRAG. It eliminates LLM token costs during graph construction, making GraphRAG faster and more efficient than ever.
+基于论文 [LinearRAG: Linear Graph Retrieval Augmented Generation on Large-scale Corpora](https://arxiv.org/pdf/2510.10114) 的重构版本。
 
-<p align="center">
-  <a href="https://arxiv.org/abs/2510.10114" target="_blank">
-    <img src="https://img.shields.io/badge/Paper-Arxiv-red?logo=arxiv&style=flat-square" alt="arXiv:2506.08938">
-  </a>
-  <a href="https://huggingface.co/datasets/Zly0523/linear-rag/tree/main" target="_blank">
-    <img src="https://img.shields.io/badge/HuggingFace-Model-yellow?logo=huggingface&style=flat-square" alt="HuggingFace">
-  </a>
-  <a href="https://github.com/LuyaoZhuang/linear-rag" target="_blank">
-    <img src="https://img.shields.io/badge/GitHub-Project-181717?logo=github&style=flat-square" alt="GitHub">
-  </a>
-</p>
+这次重构重点：
 
----
-## 🎉 **News**
-- **[2026-04-07]** Our **[ProbeRAG](https://arxiv.org/abs/2510.12460)** for RAG faithfulness is accepted by ACL'26.
-- **[2026-04-07]** Our **[BAPO](https://arxiv.org/abs/2601.11037)** for reliable agentic search is accepted by ACL'26.
-- **[2026-04-07]** Our **[LegalGraphRAG](https://www.researchgate.net/publication/403734810_LegalGraphRAG_Multi-Agent_Graph_Retrieval-Augmented_Generation_for_Reliable_Legal_Reasoning)** for reliable legal reasoning is accepted by ACL'26.
-- **[2026-04-07]** Our **[LogicPoison](https://arxiv.org/abs/2604.02954)**, a GraphRAG attack model, is accepted by ACL'26.
-- **[2026-01-26]** Our **[LinearRAG](https://github.com/DEEP-PolyU/LinearRAG)** for efficient GraphRAG is accepted by ICLR’26.
-- **[2026-01-26]** Our **[GraphRAG Benchmark](https://github.com/GraphRAG-Bench/GraphRAG-Benchmark)** is accepted by ICLR’26.
-- **[2025-10-27]** We release **[LinearRAG](https://github.com/DEEP-PolyU/LinearRAG)**, a relation-free graph construction method for efficient GraphRAG.
-- **[2025-06-06]** We release the **[GraphRAG Benchmark](https://github.com/GraphRAG-Bench/GraphRAG-Benchmark.git)** for evaluating GraphRAG models.
-- **[2025-01-21]** We release the **[GraphRAG survey](https://github.com/DEEP-PolyU/Awesome-GraphRAG)**.
+- `LLM` 和 `Embedding` 改为 `LangChain` 接入，配置从 `.env` 读取。
+- 向量检索、关键词检索、向量存储统一走 `Elasticsearch`。
+- 图能力抽象成 `KnowledgeGraph`，默认实现为 `igraph`，后续可扩展到 `Neo4j` 等后端。
+- 项目依赖切换到 `uv` 管理。
 
----
+## 架构
 
-## 🚀 **Highlights**
-- ✅ **Context-Preserving**: Relation-free graph construction, relying on lightweight entity recognition and semantic linking to achieve comprehensive contextual comprehension. 
-- ✅ **Complex Reasoning**: Enables deep retrieval via semantic bridging, achieving multi-hop reasoning in a single retrieval pass without requiring explicit relational graphs.
-- ✅ **High Scalability**: Zero LLM token consumption, faster processing speed, and linear time/space complexity.
-  
-<p align="center">
-  <img src="figure/main_figure.png" width="95%" alt="Framework Overview">
-</p>
+- `src/langchain_clients.py`
+  - `ChatOpenAI` / `OpenAIEmbeddings` 封装。
+- `src/document_store.py`
+  - 单索引 ES 文档存储，使用 `doc_type` 区分 `passage`、`entity`、`sentence`。
+- `src/knowledge_graph.py`
+  - 图抽象接口和 `igraph` 默认实现。
+- `src/LinearRAG.py`
+  - 保留论文里的主流程：`seed entity retrieval -> sentence expansion -> passage weighting -> personalized PageRank`。
+- `src/elastic_utils.py`
+  - 在尽量兼容原接口的前提下，增强了索引创建、过滤检索、批量 upsert 等能力。
 
----
+## 环境准备
 
-## 🛠️ **Usage**
-
-### 1️⃣ Install Dependencies  
-
-**Step 1: Install Python packages**
+1. 安装依赖
 
 ```bash
-pip install -r requirements.txt
-(Use Python 3.9 preferably)
+uv sync
 ```
 
-**Step 2: Download Spacy language model**
+2. 下载 spaCy 模型
 
 ```bash
-python -m spacy download en_core_web_trf
+uv run python -m spacy download en_core_web_trf
 ```
 
-> **Note:** For the `medical` dataset, you need to install the scientific/biomedical Spacy model:
-```bash
-pip install https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.3/en_core_sci_scibert-0.5.3.tar.gz
-```
-
-**Step 3: Set up your OpenAI API key**
+3. 配置环境变量
 
 ```bash
-export OPENAI_API_KEY="your-api-key-here"
-export OPENAI_BASE_URL="your-base-url-here"
+cp .env.example .env
 ```
 
-**Step 4: Download Datasets**
+默认配置已经按当前项目需求填好：
 
-Download the datasets from HuggingFace and place them in the `dataset/` folder:
+- `OPENAI_BASE_URL=https://miyun.archermind.com/v1`
+- `OPENAI_API_KEY=123`
+- `ES_URL=http://127.0.0.1:9200`
+- `ES_USER=elastic`
+- `ES_PWD=elastic@2024`
+
+4. 准备数据集
+
+目录结构保持不变：
+
+```text
+dataset/
+  <dataset_name>/
+    chunks.json
+    questions.json
+```
+
+## 运行
 
 ```bash
-git clone https://huggingface.co/datasets/Zly0523/linear-rag
-cp -r linear-rag/* dataset/
+uv run python run.py --dataset_name 2wikimultihop
 ```
 
-**Step 5: Prepare Embedding Model**
+常用参数：
 
-Make sure the embedding model is available at:
+- `--llm_model`
+- `--embedding_model`
+- `--spacy_model`
+- `--max_workers`
+- `--max_iterations`
+- `--iteration_threshold`
+- `--passage_ratio`
+- `--top_k_sentence`
+- `--skip_eval`
 
-```
-model/all-mpnet-base-v2/
-```
-
-
-### 2️⃣ Quick Start Example
+也可以直接用脚本：
 
 ```bash
-SPACY_MODEL="en_core_web_trf"
-EMBEDDING_MODEL="model/all-mpnet-base-v2"
-DATASET_NAME="2wikimultihop"
-LLM_MODEL="gpt-4o-mini"
-MAX_WORKERS=16
-
-python run.py \
-    --spacy_model ${SPACY_MODEL} \
-    --embedding_model ${EMBEDDING_MODEL} \
-    --dataset_name ${DATASET_NAME} \
-    --llm_model ${LLM_MODEL} \
-    --max_workers ${MAX_WORKERS} 
-    # --use_vectorized_retrieval # optional, use vectorized matrix-based retrieval for GPU acceleration if Strong GPU is available, otherwise use BFS iteration.
+bash scripts/run.sh
 ```
 
-## 🎯 **Performance**
+## Elasticsearch 设计
 
-<div align="center">
-<img src="figure/generation_results.png" alt="framework" width="1000">
+默认每个数据集使用一个 index：
 
-**Main results of end-to-end performance**
-</div>
-<div align="center">
-<img src="figure/efficiency_result.png" alt="framework" width="1000">
+- index 名格式：`linearrag-<dataset_name>`
+- 同一个 index 中的文档通过 `doc_type` 字段区分：
+  - `passage`
+  - `entity`
+  - `sentence`
 
-**Efficiency and performance comparison.**
-</div>
+不再为不同向量类型拆多个 index。
 
+## 输出
 
-## 📬 Citation
+- 检索缓存：`import/<dataset_name>/`
+- 图导出：`import/<dataset_name>/LinearRAG.graphml`
+- 运行结果：`results/<dataset_name>/<timestamp>/`
 
-If you find this work helpful, please consider citing us:
-```bibtex
-@article{zhuang2025linearrag,
-  title={LinearRAG: Linear Graph Retrieval Augmented Generation on Large-scale Corpora},
-  author={Zhuang, Luyao and Chen, Shengyuan and Xiao, Yilin and Zhou, Huachi and Zhang, Yujing and Chen, Hao and Zhang, Qinggang and Huang, Xiao},
-  journal={arXiv preprint arXiv:2510.10114},
-  year={2025}
-}
-``` 
+## 说明
+
+- 当前图后端只实现了 `igraph`。
+- `Neo4j` 等其他知识图谱实现的扩展点已经通过 `KnowledgeGraph` 抽象预留。
+- 如果 ES 中不存在目标 index，程序会自动按 embedding 维度创建。
