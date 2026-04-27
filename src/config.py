@@ -30,7 +30,6 @@ class LinearRAGConfig:
     dataset_name: str
     spacy_model: str = field(default_factory=lambda: os.getenv("SPACY_MODEL", "en_core_web_trf"))
     data_dir: Path = field(default_factory=lambda: Path(os.getenv("DATA_DIR", "dataset")))
-    working_dir: Path = field(default_factory=lambda: Path(os.getenv("WORKING_DIR", "import")))
     results_dir: Path = field(default_factory=lambda: Path(os.getenv("RESULTS_DIR", "results")))
 
     llm_model_name: str = field(default_factory=lambda: os.getenv("LLM_MODEL", "gpt-4o-mini"))
@@ -87,17 +86,5 @@ class LinearRAGConfig:
         return self.data_dir / self.dataset_name
 
     @property
-    def cache_dir(self) -> Path:
-        return self.working_dir / self.dataset_name
-
-    @property
     def index_name(self) -> str:
         return _sanitize_index_name(self.dataset_name)
-
-    @property
-    def ner_results_path(self) -> Path:
-        return self.cache_dir / "ner_results.json"
-
-    @property
-    def graph_path(self) -> Path:
-        return self.cache_dir / "LinearRAG.graphml"

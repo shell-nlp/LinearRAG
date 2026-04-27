@@ -46,8 +46,30 @@ class ElasticsearchDocumentStore:
             return []
         return self.client.add_batch([document.to_payload() for document in documents], index_name=self.index_name)
 
+    def index_exists(self) -> bool:
+        return self.client.index_exists(index_name=self.index_name)
+
     def get(self, doc_id: str) -> dict[str, Any] | None:
         return self.client.get(doc_id=doc_id, index_name=self.index_name)
+
+    def get_many(self, doc_ids: Iterable[str]) -> list[dict[str, Any]]:
+        return self.client.get_many(doc_ids=doc_ids, index_name=self.index_name)
+
+    def update_metadata(self, doc_id: str, metadata: dict[str, Any]) -> bool:
+        return self.client.update(doc_id=doc_id, metadata=metadata, index_name=self.index_name)
+
+    def get_documents(self, doc_type: str | None = None, ids: Iterable[str] | None = None) -> list[dict[str, Any]]:
+        if ids is not None:
+            documents = self.get_many(doc_ids=ids)
+            if doc_type is None:
+                return documents
+            return [document for document in documents if document.get("doc_type") == doc_type]
+
+        filters = {"doc_type": doc_type} if doc_type else None
+        return self.client.search_all(filter_conditions=filters, index_name=self.index_name)
+
+    def existing_ids(self, doc_ids: Iterable[str]) -> set[str]:
+        return self.client.existing_ids(doc_ids=doc_ids, index_name=self.index_name)
 
     def count(self, doc_type: str | None = None) -> int:
         filters = {"doc_type": doc_type} if doc_type else None

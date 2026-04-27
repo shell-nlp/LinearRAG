@@ -99,9 +99,8 @@ bash scripts/run.sh
 
 ## 输出
 
-- 检索缓存：`import/<dataset_name>/`
-- 图导出：`import/<dataset_name>/LinearRAG.graphml`
-- 运行结果：`results/<dataset_name>/<timestamp>/`
+- passage/entity/sentence 索引数据全部保存在 Elasticsearch 中。
+- 运行结果保存在 `results/<dataset_name>/<timestamp>/`。
 
 ## 说明
 

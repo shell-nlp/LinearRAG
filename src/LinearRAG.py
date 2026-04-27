@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import math
 import re
@@ -35,25 +34,16 @@ class LinearRAG:
         self._reset_runtime_state()
 
     def _reset_runtime_state(self) -> None:
+        """重置当前进程内的运行态。ES 才是持久化数据源，这里只保留本次检索需要的内存索引。"""
         self.graph.clear()
         self.ordered_passage_ids: list[str] = []
         self.passage_hash_id_to_text: dict[str, str] = {}
         self.entity_hash_id_to_text: dict[str, str] = {}
         self.sentence_hash_id_to_text: dict[str, str] = {}
         self.passage_hash_id_to_entity_hash_ids: dict[str, list[str]] = {}
+        self.passage_hash_id_to_sentence_hash_ids: dict[str, list[str]] = {}
         self.entity_hash_id_to_sentence_hash_ids: dict[str, list[str]] = {}
         self.sentence_hash_id_to_entity_hash_ids: dict[str, list[str]] = {}
-
-    def load_existing_data(self, passage_hash_ids: list[str]) -> tuple[dict[str, list[str]], dict[str, list[str]], set[str]]:
-        if self.config.ner_results_path.exists():
-            with self.config.ner_results_path.open("r", encoding="utf-8") as file:
-                existing_ner_results = json.load(file)
-            existing_passage_hash_id_to_entities = existing_ner_results["passage_hash_id_to_entities"]
-            existing_sentence_to_entities = existing_ner_results["sentence_to_entities"]
-            existing_passage_hash_ids = set(existing_passage_hash_id_to_entities.keys())
-            new_passage_hash_ids = set(passage_hash_ids) - existing_passage_hash_ids
-            return existing_passage_hash_id_to_entities, existing_sentence_to_entities, new_passage_hash_ids
-        return {}, {}, set(passage_hash_ids)
 
     def qa(self, questions: list[dict[str, str]]) -> list[dict[str, object]]:
         retrieval_results = self.retrieve(questions)
@@ -177,6 +167,7 @@ class LinearRAG:
         question: str,
         seed_entities: list[dict[str, object]],
     ) -> tuple[dict[str, float], dict[str, tuple[float, int]]]:
+        """论文中的第一阶段：从 seed entity 出发，经由 sentence 节点做逐层扩展。"""
         entity_weights: dict[str, float] = defaultdict(float)
         active_entities: dict[str, tuple[float, int]] = {}
         current_entities: dict[str, tuple[float, int]] = {}
@@ -219,8 +210,7 @@ class LinearRAG:
                             continue
                         entity_weights[next_entity_hash_id] += next_entity_score
                         previous_score, _ = new_entities.get(next_entity_hash_id, (0.0, iteration + 1))
-                        combined_score = previous_score + next_entity_score
-                        new_entities[next_entity_hash_id] = (combined_score, iteration + 1)
+                        new_entities[next_entity_hash_id] = (previous_score + next_entity_score, iteration + 1)
 
             if not new_entities:
                 break
@@ -234,6 +224,7 @@ class LinearRAG:
         question: str,
         active_entities: dict[str, tuple[float, int]],
     ) -> dict[str, float]:
+        """论文中的第二阶段：用 dense passage score + entity bonus 构造 PPR reset 权重。"""
         candidate_hits = self.dense_passage_retrieval(question, self.config.passage_search_candidate_k)
         if not candidate_hits:
             return {}
@@ -295,109 +286,188 @@ class LinearRAG:
         return overlap
 
     def index(self, passages: list[str]) -> None:
+        """
+        以 ES 为唯一持久化存储构建索引。
+
+        处理顺序：
+        1. 先根据当前输入生成 passage id。
+        2. 去 ES 判断哪些 passage 已存在，只对新增 passage 做 NER。
+        3. 把新增 passage 产生的 passage/entity/sentence 文档写回 ES。
+        4. 再从 ES 回读当前数据集状态，重建运行时图结构。
+        """
         logger.info("Indexing dataset=%s into Elasticsearch index=%s", self.config.dataset_name, self.config.index_name)
         self._reset_runtime_state()
+        self._prepare_passages(passages)
 
+        existing_passage_ids, new_passage_ids = self._split_existing_and_new_passages()
+        logger.info(
+            "ES passage state: existing=%s, new=%s",
+            len(existing_passage_ids),
+            len(new_passage_ids),
+        )
+
+        self._sync_existing_passage_metadata(existing_passage_ids)
+
+        if new_passage_ids:
+            (
+                new_passage_hash_id_to_entities,
+                new_sentence_to_entities,
+                new_passage_hash_id_to_sentences,
+            ) = self._extract_new_passage_state(new_passage_ids)
+            self._persist_new_state_to_es(
+                new_passage_hash_id_to_entities=new_passage_hash_id_to_entities,
+                new_sentence_to_entities=new_sentence_to_entities,
+                new_passage_hash_id_to_sentences=new_passage_hash_id_to_sentences,
+            )
+
+        # 最终运行态全部从 ES 回读，避免内存和 ES 状态不一致。
+        self._load_runtime_state_from_es()
+        self._build_graph_from_runtime_state()
+
+    def _prepare_passages(self, passages: list[str]) -> None:
+        """把本次输入规范化为稳定 id，后续所有 ES 检查都基于这些 id。"""
         self.passage_hash_id_to_text = {
             compute_mdhash_id(passage, prefix="passage-"): passage for passage in passages
         }
         self.ordered_passage_ids = list(self.passage_hash_id_to_text.keys())
 
-        (
-            existing_passage_hash_id_to_entities,
-            existing_sentence_to_entities,
-            new_passage_hash_ids,
-        ) = self.load_existing_data(self.ordered_passage_ids)
+    def _split_existing_and_new_passages(self) -> tuple[list[str], list[str]]:
+        existing_ids = self.document_store.existing_ids(self.ordered_passage_ids)
+        existing_passage_ids = [passage_id for passage_id in self.ordered_passage_ids if passage_id in existing_ids]
+        new_passage_ids = [passage_id for passage_id in self.ordered_passage_ids if passage_id not in existing_ids]
+        return existing_passage_ids, new_passage_ids
 
-        if new_passage_hash_ids:
-            new_hash_id_to_passage = {
-                passage_hash_id: self.passage_hash_id_to_text[passage_hash_id]
-                for passage_hash_id in new_passage_hash_ids
-            }
-            new_passage_hash_id_to_entities, new_sentence_to_entities = self.spacy_ner.batch_ner(
-                new_hash_id_to_passage,
-                self.config.max_workers,
-            )
-            self.merge_ner_results(
-                existing_passage_hash_id_to_entities,
-                existing_sentence_to_entities,
-                new_passage_hash_id_to_entities,
-                new_sentence_to_entities,
-            )
+    def _sync_existing_passage_metadata(self, existing_passage_ids: list[str]) -> None:
+        """已有 passage 不需要重新做 NER，但要把本次顺序信息同步回 ES。"""
+        if not existing_passage_ids:
+            return
 
-        self.save_ner_results(existing_passage_hash_id_to_entities, existing_sentence_to_entities)
-        (
-            entity_nodes,
-            sentence_nodes,
-            passage_hash_id_to_entities,
-            entity_to_sentence,
-            sentence_to_entity,
-        ) = self.extract_nodes_and_edges(existing_passage_hash_id_to_entities, existing_sentence_to_entities)
-
-        self.entity_hash_id_to_text = {
-            compute_mdhash_id(entity_text, prefix="entity-"): entity_text for entity_text in sorted(entity_nodes)
+        sequence_index_by_passage_id = {
+            passage_id: index for index, passage_id in enumerate(self.ordered_passage_ids)
         }
-        self.sentence_hash_id_to_text = {
-            compute_mdhash_id(sentence_text, prefix="sentence-"): sentence_text for sentence_text in sorted(sentence_nodes)
+        for passage_doc in self.document_store.get_documents(doc_type="passage", ids=existing_passage_ids):
+            metadata = dict(passage_doc.get("metadata", {}))
+            metadata["dataset_name"] = self.config.dataset_name
+            metadata["sequence_index"] = sequence_index_by_passage_id[passage_doc["id"]]
+            self.document_store.update_metadata(doc_id=passage_doc["id"], metadata=metadata)
+
+    def _extract_new_passage_state(
+        self,
+        new_passage_ids: list[str],
+    ) -> tuple[dict[str, list[str]], dict[str, list[str]], dict[str, list[str]]]:
+        new_hash_id_to_passage = {
+            passage_hash_id: self.passage_hash_id_to_text[passage_hash_id]
+            for passage_hash_id in new_passage_ids
+        }
+        return self.spacy_ner.batch_ner(new_hash_id_to_passage, self.config.max_workers)
+
+    def _persist_new_state_to_es(
+        self,
+        new_passage_hash_id_to_entities: dict[str, list[str]],
+        new_sentence_to_entities: dict[str, list[str]],
+        new_passage_hash_id_to_sentences: dict[str, list[str]],
+    ) -> None:
+        """
+        仅把新增 passage 产生的数据写入 ES。
+
+        entity/sentence 文档可能已存在，因此这里先读取 ES 里的旧关系，再做集合合并后回写。
+        """
+        existing_entity_docs = self.document_store.get_documents(doc_type="entity")
+        existing_sentence_docs = self.document_store.get_documents(doc_type="sentence")
+
+        entity_hash_id_to_text = {doc["id"]: doc["content"] for doc in existing_entity_docs}
+        entity_hash_id_to_sentence_hash_ids = {
+            doc["id"]: set(self._metadata_ids(doc, "sentence_hash_ids")) for doc in existing_entity_docs
+        }
+        sentence_hash_id_to_text = {doc["id"]: doc["content"] for doc in existing_sentence_docs}
+        sentence_hash_id_to_entity_hash_ids = {
+            doc["id"]: set(self._metadata_ids(doc, "entity_hash_ids")) for doc in existing_sentence_docs
+        }
+        sentence_hash_id_to_passage_hash_ids = {
+            doc["id"]: set(self._metadata_ids(doc, "passage_hash_ids")) for doc in existing_sentence_docs
         }
 
-        entity_text_to_hash_id = {text: hash_id for hash_id, text in self.entity_hash_id_to_text.items()}
-        sentence_text_to_hash_id = {text: hash_id for hash_id, text in self.sentence_hash_id_to_text.items()}
+        passage_hash_id_to_entity_hash_ids: dict[str, list[str]] = {}
+        passage_hash_id_to_sentence_hash_ids: dict[str, list[str]] = {}
 
-        self.passage_hash_id_to_entity_hash_ids = {
-            passage_hash_id: sorted(entity_text_to_hash_id[entity_text] for entity_text in entity_texts)
-            for passage_hash_id, entity_texts in passage_hash_id_to_entities.items()
-        }
-        self.entity_hash_id_to_sentence_hash_ids = {
-            entity_text_to_hash_id[entity_text]: sorted(sentence_text_to_hash_id[sentence_text] for sentence_text in sentence_texts)
-            for entity_text, sentence_texts in entity_to_sentence.items()
-        }
-        self.sentence_hash_id_to_entity_hash_ids = {
-            sentence_text_to_hash_id[sentence_text]: sorted(entity_text_to_hash_id[entity_text] for entity_text in entity_texts)
-            for sentence_text, entity_texts in sentence_to_entity.items()
+        for sentence_text, entity_texts in new_sentence_to_entities.items():
+            sentence_hash_id = compute_mdhash_id(sentence_text, prefix="sentence-")
+            sentence_hash_id_to_text[sentence_hash_id] = sentence_text
+            for entity_text in entity_texts:
+                entity_hash_id = compute_mdhash_id(entity_text, prefix="entity-")
+                entity_hash_id_to_text[entity_hash_id] = entity_text
+                entity_hash_id_to_sentence_hash_ids.setdefault(entity_hash_id, set()).add(sentence_hash_id)
+                sentence_hash_id_to_entity_hash_ids.setdefault(sentence_hash_id, set()).add(entity_hash_id)
+
+        for passage_hash_id, sentence_texts in new_passage_hash_id_to_sentences.items():
+            sentence_hash_ids = [
+                compute_mdhash_id(sentence_text, prefix="sentence-")
+                for sentence_text in sentence_texts
+            ]
+            passage_hash_id_to_sentence_hash_ids[passage_hash_id] = sentence_hash_ids
+            for sentence_hash_id in sentence_hash_ids:
+                sentence_hash_id_to_passage_hash_ids.setdefault(sentence_hash_id, set()).add(passage_hash_id)
+
+        for passage_hash_id, entity_texts in new_passage_hash_id_to_entities.items():
+            entity_hash_ids = [
+                compute_mdhash_id(entity_text, prefix="entity-")
+                for entity_text in entity_texts
+            ]
+            passage_hash_id_to_entity_hash_ids[passage_hash_id] = sorted(entity_hash_ids)
+
+        sequence_index_by_passage_id = {
+            passage_id: index for index, passage_id in enumerate(self.ordered_passage_ids)
         }
 
-        self._index_documents()
-        self._build_graph()
-        self.graph.save(self.config.graph_path)
-
-    def _index_documents(self) -> None:
         passage_documents = []
-        for sequence_index, (passage_hash_id, passage_text) in enumerate(self.passage_hash_id_to_text.items()):
+        for passage_hash_id, entity_texts in new_passage_hash_id_to_entities.items():
+            passage_text = self.passage_hash_id_to_text[passage_hash_id]
             passage_documents.append(
                 self.document_store.build_document(
                     doc_type="passage",
                     content=passage_text,
                     metadata={
                         "dataset_name": self.config.dataset_name,
-                        "sequence_index": sequence_index,
-                        "entity_hash_ids": self.passage_hash_id_to_entity_hash_ids.get(passage_hash_id, []),
+                        "sequence_index": sequence_index_by_passage_id[passage_hash_id],
+                        "entity_hash_ids": passage_hash_id_to_entity_hash_ids.get(passage_hash_id, []),
+                        "entity_texts": entity_texts,
+                        "sentence_hash_ids": passage_hash_id_to_sentence_hash_ids.get(passage_hash_id, []),
                     },
                 )
             )
 
         entity_documents = []
-        for entity_hash_id, entity_text in self.entity_hash_id_to_text.items():
+        updated_entity_ids = {
+            compute_mdhash_id(entity_text, prefix="entity-")
+            for entity_texts in new_passage_hash_id_to_entities.values()
+            for entity_text in entity_texts
+        }
+        for entity_hash_id in sorted(updated_entity_ids):
             entity_documents.append(
                 self.document_store.build_document(
                     doc_type="entity",
-                    content=entity_text,
+                    content=entity_hash_id_to_text[entity_hash_id],
                     metadata={
                         "dataset_name": self.config.dataset_name,
-                        "sentence_hash_ids": self.entity_hash_id_to_sentence_hash_ids.get(entity_hash_id, []),
+                        "sentence_hash_ids": sorted(entity_hash_id_to_sentence_hash_ids.get(entity_hash_id, set())),
                     },
                 )
             )
 
         sentence_documents = []
-        for sentence_hash_id, sentence_text in self.sentence_hash_id_to_text.items():
+        updated_sentence_ids = {
+            compute_mdhash_id(sentence_text, prefix="sentence-")
+            for sentence_text in new_sentence_to_entities.keys()
+        }
+        for sentence_hash_id in sorted(updated_sentence_ids):
             sentence_documents.append(
                 self.document_store.build_document(
                     doc_type="sentence",
-                    content=sentence_text,
+                    content=sentence_hash_id_to_text[sentence_hash_id],
                     metadata={
                         "dataset_name": self.config.dataset_name,
-                        "entity_hash_ids": self.sentence_hash_id_to_entity_hash_ids.get(sentence_hash_id, []),
+                        "entity_hash_ids": sorted(sentence_hash_id_to_entity_hash_ids.get(sentence_hash_id, set())),
+                        "passage_hash_ids": sorted(sentence_hash_id_to_passage_hash_ids.get(sentence_hash_id, set())),
                     },
                 )
             )
@@ -406,26 +476,110 @@ class LinearRAG:
         self.document_store.upsert_documents(entity_documents)
         self.document_store.upsert_documents(sentence_documents)
 
-    def _build_graph(self) -> None:
+    def _load_runtime_state_from_es(self) -> None:
+        """
+        从 ES 回读当前数据集对应的 passage/entity/sentence 文档。
+
+        注意：
+        - 这里只回读本次输入 passage 对应的文档，不把 ES 中其他无关 passage 混进来。
+        - entity 和 sentence 则按 passage 元数据里的引用继续向外展开。
+        """
+        passage_docs = {
+            doc["id"]: doc
+            for doc in self.document_store.get_documents(doc_type="passage", ids=self.ordered_passage_ids)
+        }
+
+        self.ordered_passage_ids = [
+            passage_id for passage_id in self.ordered_passage_ids if passage_id in passage_docs
+        ]
+        self.passage_hash_id_to_text = {
+            passage_id: passage_docs[passage_id]["content"] for passage_id in self.ordered_passage_ids
+        }
+        self.passage_hash_id_to_entity_hash_ids = {
+            passage_id: self._metadata_ids(passage_docs[passage_id], "entity_hash_ids")
+            for passage_id in self.ordered_passage_ids
+        }
+        self.passage_hash_id_to_sentence_hash_ids = {
+            passage_id: self._metadata_ids(passage_docs[passage_id], "sentence_hash_ids")
+            for passage_id in self.ordered_passage_ids
+        }
+
+        entity_ids = sorted(
+            {
+                entity_hash_id
+                for entity_hash_ids in self.passage_hash_id_to_entity_hash_ids.values()
+                for entity_hash_id in entity_hash_ids
+            }
+        )
+        entity_docs = self.document_store.get_documents(doc_type="entity", ids=entity_ids)
+        self.entity_hash_id_to_text = {doc["id"]: doc["content"] for doc in entity_docs}
+        self.entity_hash_id_to_sentence_hash_ids = {
+            doc["id"]: self._metadata_ids(doc, "sentence_hash_ids")
+            for doc in entity_docs
+        }
+
+        sentence_ids = sorted(
+            {
+                sentence_hash_id
+                for sentence_hash_ids in self.entity_hash_id_to_sentence_hash_ids.values()
+                for sentence_hash_id in sentence_hash_ids
+            }
+            | {
+                sentence_hash_id
+                for sentence_hash_ids in self.passage_hash_id_to_sentence_hash_ids.values()
+                for sentence_hash_id in sentence_hash_ids
+            }
+        )
+        sentence_docs = self.document_store.get_documents(doc_type="sentence", ids=sentence_ids)
+        self.sentence_hash_id_to_text = {doc["id"]: doc["content"] for doc in sentence_docs}
+        self.sentence_hash_id_to_entity_hash_ids = {
+            doc["id"]: self._metadata_ids(doc, "entity_hash_ids")
+            for doc in sentence_docs
+        }
+
+        # 某些旧数据可能没有 sentence -> entity 元数据，这里用 entity 的反向引用补齐。
+        for entity_hash_id, sentence_hash_ids in self.entity_hash_id_to_sentence_hash_ids.items():
+            for sentence_hash_id in sentence_hash_ids:
+                self.sentence_hash_id_to_entity_hash_ids.setdefault(sentence_hash_id, [])
+                if entity_hash_id not in self.sentence_hash_id_to_entity_hash_ids[sentence_hash_id]:
+                    self.sentence_hash_id_to_entity_hash_ids[sentence_hash_id].append(entity_hash_id)
+
+        for sentence_hash_id in list(self.sentence_hash_id_to_entity_hash_ids.keys()):
+            self.sentence_hash_id_to_entity_hash_ids[sentence_hash_id] = sorted(
+                set(self.sentence_hash_id_to_entity_hash_ids[sentence_hash_id])
+            )
+
+        logger.info(
+            "Loaded runtime state from ES: passages=%s, entities=%s, sentences=%s",
+            len(self.passage_hash_id_to_text),
+            len(self.entity_hash_id_to_text),
+            len(self.sentence_hash_id_to_text),
+        )
+
+    def _build_graph_from_runtime_state(self) -> None:
+        """图只在内存里重建，不再写本地 graphml。"""
+        self.graph.clear()
         for passage_hash_id, passage_text in self.passage_hash_id_to_text.items():
             self.graph.add_node(passage_hash_id, passage_text, "passage")
         for entity_hash_id, entity_text in self.entity_hash_id_to_text.items():
             self.graph.add_node(entity_hash_id, entity_text, "entity")
 
-        self.add_entity_to_passage_edges()
-        self.add_adjacent_passage_edges()
+        self._add_entity_to_passage_edges()
+        self._add_adjacent_passage_edges()
 
-    def add_adjacent_passage_edges(self) -> None:
+    def _add_adjacent_passage_edges(self) -> None:
         for current_passage_id, next_passage_id in zip(self.ordered_passage_ids, self.ordered_passage_ids[1:]):
             self.graph.add_edge(current_passage_id, next_passage_id, weight=1.0)
 
-    def add_entity_to_passage_edges(self) -> None:
+    def _add_entity_to_passage_edges(self) -> None:
         for passage_hash_id, entity_hash_ids in self.passage_hash_id_to_entity_hash_ids.items():
             passage_text = self.passage_hash_id_to_text[passage_hash_id]
             entity_counts = {}
             total_mentions = 0
             for entity_hash_id in entity_hash_ids:
-                entity_text = self.entity_hash_id_to_text[entity_hash_id]
+                entity_text = self.entity_hash_id_to_text.get(entity_hash_id)
+                if not entity_text:
+                    continue
                 count = passage_text.count(entity_text)
                 if count <= 0:
                     continue
@@ -442,70 +596,10 @@ class LinearRAG:
                     weight=count / total_mentions,
                 )
 
-    def extract_nodes_and_edges(
-        self,
-        existing_passage_hash_id_to_entities: dict[str, list[str]],
-        existing_sentence_to_entities: dict[str, list[str]],
-    ) -> tuple[
-        set[str],
-        set[str],
-        dict[str, set[str]],
-        dict[str, set[str]],
-        dict[str, set[str]],
-    ]:
-        entity_nodes = set()
-        sentence_nodes = set()
-        passage_hash_id_to_entities: dict[str, set[str]] = defaultdict(set)
-        entity_to_sentence: dict[str, set[str]] = defaultdict(set)
-        sentence_to_entity: dict[str, set[str]] = defaultdict(set)
-
-        for passage_hash_id, entities in existing_passage_hash_id_to_entities.items():
-            for entity in entities:
-                entity_nodes.add(entity)
-                passage_hash_id_to_entities[passage_hash_id].add(entity)
-
-        for sentence, entities in existing_sentence_to_entities.items():
-            sentence_nodes.add(sentence)
-            for entity in entities:
-                entity_nodes.add(entity)
-                entity_to_sentence[entity].add(sentence)
-                sentence_to_entity[sentence].add(entity)
-
-        return (
-            entity_nodes,
-            sentence_nodes,
-            passage_hash_id_to_entities,
-            entity_to_sentence,
-            sentence_to_entity,
-        )
-
-    def merge_ner_results(
-        self,
-        existing_passage_hash_id_to_entities: dict[str, list[str]],
-        existing_sentence_to_entities: dict[str, list[str]],
-        new_passage_hash_id_to_entities: dict[str, list[str]],
-        new_sentence_to_entities: dict[str, list[str]],
-    ) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
-        existing_passage_hash_id_to_entities.update(new_passage_hash_id_to_entities)
-        for sentence, entities in new_sentence_to_entities.items():
-            merged_entities = set(existing_sentence_to_entities.get(sentence, []))
-            merged_entities.update(entities)
-            existing_sentence_to_entities[sentence] = sorted(merged_entities)
-        return existing_passage_hash_id_to_entities, existing_sentence_to_entities
-
-    def save_ner_results(
-        self,
-        existing_passage_hash_id_to_entities: dict[str, list[str]],
-        existing_sentence_to_entities: dict[str, list[str]],
-    ) -> None:
-        self.config.cache_dir.mkdir(parents=True, exist_ok=True)
-        with self.config.ner_results_path.open("w", encoding="utf-8") as file:
-            json.dump(
-                {
-                    "passage_hash_id_to_entities": existing_passage_hash_id_to_entities,
-                    "sentence_to_entities": existing_sentence_to_entities,
-                },
-                file,
-                ensure_ascii=False,
-                indent=2,
-            )
+    def _metadata_ids(self, document: dict[str, object], key: str) -> list[str]:
+        value = document.get("metadata", {}).get(key, [])
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [str(item) for item in value]
+        return [str(value)]

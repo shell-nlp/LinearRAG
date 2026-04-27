@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, Iterable, List, Optional
 
 from elasticsearch import Elasticsearch as ESClient
+from elasticsearch.helpers import scan
 from loguru import logger
 
 
@@ -71,6 +72,11 @@ class Elasticsearch:
 
         self.es_client.indices.create(index=index_name, mappings=base_mappings)
 
+    def index_exists(self, index_name: Optional[str] = None) -> bool:
+        if not index_name:
+            raise ValueError("index_name is required for index_exists operations")
+        return bool(self.es_client.indices.exists(index=index_name))
+
     def vector_search(
         self,
         query: str,
@@ -82,6 +88,8 @@ class Elasticsearch:
     ) -> List[Dict[str, Any]]:
         if not index_name:
             raise ValueError("index_name is required for search operations")
+        if not self.index_exists(index_name=index_name):
+            return []
         return self._vector_search_raw(
             query=query,
             k=k,
@@ -100,6 +108,8 @@ class Elasticsearch:
     ) -> List[Dict[str, Any]]:
         if not index_name:
             raise ValueError("index_name is required for search operations")
+        if not self.index_exists(index_name=index_name):
+            return []
 
         bool_query: Dict[str, Any] = {
             "must": [
@@ -128,6 +138,8 @@ class Elasticsearch:
     ) -> List[Dict[str, Any]]:
         if not index_name:
             raise ValueError("index_name is required for retrieve operations")
+        if not self.index_exists(index_name=index_name):
+            return []
 
         vector_results = self.vector_search(query, k, index_name, filter_conditions=filter_conditions)
         keyword_results = self.keyword_search(query, k, index_name, filter_conditions=filter_conditions)
@@ -355,6 +367,8 @@ class Elasticsearch:
     def get(self, doc_id: str, index_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
         if not index_name:
             raise ValueError("index_name is required for get operations")
+        if not self.index_exists(index_name=index_name):
+            return None
         try:
             result = self.es_client.get(index=index_name, id=doc_id)
         except Exception as exc:
@@ -378,6 +392,8 @@ class Elasticsearch:
     ) -> List[Dict[str, Any]]:
         if not index_name:
             raise ValueError("index_name is required for search operations")
+        if not self.index_exists(index_name=index_name):
+            return []
 
         filters = self._build_filter_clauses(filter_conditions=filter_conditions)
         if query:
@@ -406,10 +422,77 @@ class Elasticsearch:
         results = self.es_client.search(index=index_name, body=body, size=k)
         return [self._hit_to_result(hit) for hit in results["hits"]["hits"]]
 
+    def search_all(
+        self,
+        query: Optional[str] = None,
+        filter_conditions: Optional[Dict[str, Any]] = None,
+        index_name: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        if not index_name:
+            raise ValueError("index_name is required for search_all operations")
+        if not self.index_exists(index_name=index_name):
+            return []
+
+        filters = self._build_filter_clauses(filter_conditions=filter_conditions)
+        if query:
+            body: Dict[str, Any] = {
+                "query": {
+                    "bool": {
+                        "must": [
+                            {
+                                "multi_match": {
+                                    "query": query,
+                                    "fields": ["content^2", "title", "summary"],
+                                    "type": "best_fields",
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+            if filters:
+                body["query"]["bool"]["filter"] = filters
+        elif filters:
+            body = {"query": {"bool": {"filter": filters}}}
+        else:
+            body = {"query": {"match_all": {}}}
+
+        return [
+            self._hit_to_result(hit)
+            for hit in scan(
+                client=self.es_client,
+                index=index_name,
+                query=body,
+                preserve_order=False,
+            )
+        ]
+
     def exists(self, doc_id: str, index_name: Optional[str] = None) -> bool:
         if not index_name:
             raise ValueError("index_name is required for exists operations")
+        if not self.index_exists(index_name=index_name):
+            return False
         return self.es_client.exists(index=index_name, id=doc_id)
+
+    def existing_ids(self, doc_ids: Iterable[str], index_name: Optional[str] = None) -> set[str]:
+        if not index_name:
+            raise ValueError("index_name is required for existing_ids operations")
+        if not self.index_exists(index_name=index_name):
+            return set()
+
+        ids = [doc_id for doc_id in doc_ids if doc_id]
+        if not ids:
+            return set()
+
+        results = self.es_client.mget(index=index_name, ids=ids)
+        return {doc["_id"] for doc in results.get("docs", []) if doc.get("found")}
+
+    def get_many(self, doc_ids: Iterable[str], index_name: Optional[str] = None) -> List[Dict[str, Any]]:
+        if not index_name:
+            raise ValueError("index_name is required for get_many operations")
+        if not self.index_exists(index_name=index_name):
+            return []
+        return self._get_docs_by_ids(index_name=index_name, doc_ids=doc_ids)
 
     def count(
         self,
@@ -418,6 +501,8 @@ class Elasticsearch:
     ) -> int:
         if not index_name:
             raise ValueError("index_name is required for count operations")
+        if not self.index_exists(index_name=index_name):
+            return 0
 
         filters = self._build_filter_clauses(filter_conditions=filter_conditions)
         body = {"query": {"bool": {"filter": filters}}} if filters else {"query": {"match_all": {}}}
