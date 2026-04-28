@@ -28,7 +28,7 @@ def _sanitize_index_name(dataset_name: str) -> str:
 @dataclass(slots=True)
 class LinearRAGConfig:
     dataset_name: str
-    spacy_model: str = field(default_factory=lambda: os.getenv("SPACY_MODEL", "en_core_web_trf"))
+    spacy_model: str = field(default_factory=lambda: os.getenv("SPACY_MODEL", "xx_ent_wiki_sm"))
     data_dir: Path = field(default_factory=lambda: Path(os.getenv("DATA_DIR", "dataset")))
     results_dir: Path = field(default_factory=lambda: Path(os.getenv("RESULTS_DIR", "results")))
 

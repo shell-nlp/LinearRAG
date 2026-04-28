@@ -1,68 +1,52 @@
 from __future__ import annotations
 
-import argparse
 import json
 from datetime import datetime
 
-from src.LinearRAG import LinearRAG
 from src.config import LinearRAGConfig
-from src.evaluate import Evaluator
 from src.langchain_clients import LangChainEmbeddingModel, LangChainLLM
+from src.LinearRAG import LinearRAG
 from src.utils import setup_logging
 
 
-def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset_name", type=str, default="novel", help="Dataset directory under DATA_DIR")
-    parser.add_argument("--spacy_model", type=str, default=None, help="spaCy model name")
-    parser.add_argument("--llm_model", type=str, default=None, help="LLM model name")
-    parser.add_argument("--embedding_model", type=str, default=None, help="Embedding model name")
-    parser.add_argument("--max_workers", type=int, default=None, help="Maximum worker count")
-    parser.add_argument("--max_iterations", type=int, default=None, help="Maximum graph expansion iterations")
-    parser.add_argument("--iteration_threshold", type=float, default=None, help="Entity activation threshold")
-    parser.add_argument("--passage_ratio", type=float, default=None, help="Weight for dense passage retrieval")
-    parser.add_argument("--top_k_sentence", type=int, default=None, help="Top sentence count per entity expansion")
-    parser.add_argument("--skip_eval", action="store_true", help="Skip answer evaluation")
-    return parser.parse_args()
-
-
-def load_dataset(config: LinearRAGConfig) -> tuple[list[dict[str, str]], list[str]]:
-    questions_path = config.dataset_dir / "questions.json"
-    chunks_path = config.dataset_dir / "chunks.json"
-
-    with questions_path.open("r", encoding="utf-8") as file:
-        questions = json.load(file)
-    with chunks_path.open("r", encoding="utf-8") as file:
-        chunks = json.load(file)
-
-    passages = [f"{idx}:{chunk}" for idx, chunk in enumerate(chunks)]
+def build_sample_data() -> tuple[list[dict[str, str]], list[str]]:
+    questions = [
+        {"question": "Python 编程语言是由谁创建的？", "answer": "Guido van Rossum"},
+        {"question": "日本的首都是哪座城市？", "answer": "东京"},
+        {"question": "相对论是哪位科学家提出的？", "answer": "阿尔伯特·爱因斯坦"},
+    ]
+    passage_texts = [
+        (
+            "Python 是一种高级编程语言，由 Guido van Rossum 创建。"
+            "它强调代码可读性，并拥有丰富的标准库。"
+        ),
+        (
+            "东京是日本的首都，也是世界上规模最大的都市圈之一。"
+            "它同时是日本的政治中心和经济中心。"
+        ),
+        (
+            "阿尔伯特·爱因斯坦提出了相对论。"
+            "这项理论改变了现代物理学，并解释了空间、时间与引力之间的关系。"
+        ),
+        (
+            "格蕾丝·霍珀是美国计算机科学家，也是美国海军少将。"
+            "她为早期编译器的发展作出了重要贡献。"
+        ),
+        ("太平洋是地球上面积最大、最深的大洋。它从北极附近海域一直延伸到南冰洋。"),
+    ]
+    passages = [f"{idx}:{text}" for idx, text in enumerate(passage_texts)]
     return questions, passages
 
 
-def build_config(args: argparse.Namespace) -> LinearRAGConfig:
-    config = LinearRAGConfig(dataset_name=args.dataset_name)
-    if args.spacy_model:
-        config.spacy_model = args.spacy_model
-    if args.llm_model:
-        config.llm_model_name = args.llm_model
-    if args.embedding_model:
-        config.embedding_model_name = args.embedding_model
-    if args.max_workers is not None:
-        config.max_workers = args.max_workers
-    if args.max_iterations is not None:
-        config.max_iterations = args.max_iterations
-    if args.iteration_threshold is not None:
-        config.iteration_threshold = args.iteration_threshold
-    if args.passage_ratio is not None:
-        config.passage_ratio = args.passage_ratio
-    if args.top_k_sentence is not None:
-        config.top_k_sentence = args.top_k_sentence
+def build_config() -> LinearRAGConfig:
+    config = LinearRAGConfig(dataset_name="sample")
+    config.llm_model_name = "gpt-4o"
+    config.embedding_model_name = "qwen3-embedding"
     return config
 
 
 def main() -> None:
-    args = parse_arguments()
-    config = build_config(args)
+    config = build_config()
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     run_dir = config.results_dir / config.dataset_name / timestamp
@@ -70,22 +54,21 @@ def main() -> None:
 
     llm_model = LangChainLLM(config)
     embedding_model = LangChainEmbeddingModel(config)
-    questions, passages = load_dataset(config)
+    questions, passages = build_sample_data()
 
-    rag_model = LinearRAG(global_config=config, llm_model=llm_model, embedding_model=embedding_model)
+    rag_model = LinearRAG(
+        global_config=config,
+        llm_model=llm_model,
+        embedding_model=embedding_model,
+    )
     rag_model.index(passages)
     predictions = rag_model.qa(questions)
+    print(predictions)
 
     run_dir.mkdir(parents=True, exist_ok=True)
     predictions_path = run_dir / "predictions.json"
     with predictions_path.open("w", encoding="utf-8") as file:
         json.dump(predictions, file, ensure_ascii=False, indent=2)
-
-    if args.skip_eval:
-        return
-
-    evaluator = Evaluator(llm_model=llm_model, predictions_path=str(predictions_path))
-    evaluator.evaluate(max_workers=config.max_workers)
 
 
 if __name__ == "__main__":

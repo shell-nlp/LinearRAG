@@ -1,13 +1,30 @@
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 
 import spacy
 
 
+logger = logging.getLogger(__name__)
+
+
 class SpacyNER:
     def __init__(self, spacy_model: str):
-        self.spacy_model = spacy.load(spacy_model)
+        self.has_trained_ner = True
+        try:
+            self.spacy_model = spacy.load(spacy_model)
+            if not any(name in self.spacy_model.pipe_names for name in {"parser", "senter", "sentencizer"}):
+                self.spacy_model.add_pipe("sentencizer")
+        except OSError:
+            logger.warning(
+                "spaCy model '%s' is unavailable; falling back to a blank Chinese pipeline without NER.",
+                spacy_model,
+            )
+            self.spacy_model = spacy.blank("zh")
+            if "sentencizer" not in self.spacy_model.pipe_names:
+                self.spacy_model.add_pipe("sentencizer")
+            self.has_trained_ner = False
 
     def batch_ner(
         self,
@@ -45,7 +62,10 @@ class SpacyNER:
     ) -> tuple[dict[str, list[str]], dict[str, list[str]], dict[str, list[str]]]:
         sentence_to_entities: dict[str, list[str]] = defaultdict(list)
         unique_entities = set()
-        ordered_sentences: list[str] = []
+        ordered_sentences = [sentence.text.strip() for sentence in doc.sents if sentence.text.strip()]
+        if not ordered_sentences:
+            whole_text = doc.text.strip()
+            ordered_sentences = [whole_text] if whole_text else []
         for entity in doc.ents:
             if entity.label_ in {"ORDINAL", "CARDINAL"}:
                 continue
@@ -65,6 +85,8 @@ class SpacyNER:
 
     def question_ner(self, question: str) -> set[str]:
         doc = self.spacy_model(question)
+        if not self.has_trained_ner:
+            return set()
         question_entities = set()
         for entity in doc.ents:
             if entity.label_ in {"ORDINAL", "CARDINAL"}:
